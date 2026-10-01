@@ -11,7 +11,8 @@
 
 `./script1.sh <путь> [порог]`
 
-## Примеры:
+## Примеры
 
-`./script1.sh /log`          # порог по умолчанию: 70
-`./script1.sh /log 85`       # порог 85
+`./script1.sh /log`
+
+`./script1.sh /log 85`
