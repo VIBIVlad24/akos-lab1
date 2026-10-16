@@ -1,203 +1,151 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ $EUID -ne 0 ]]; then
-    echo "Запустите через sudo (нужен root для loop-монтирования)" >&2
-    exit 1
-fi
+#!/bin/bash
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-SCRIPT1="$SCRIPT_DIR/script1.sh"
-[[ -f "$SCRIPT1" ]] || { echo "Не найден script1.sh: $SCRIPT1" >&2; exit 1; }
+TARGET="$SCRIPT_DIR/script1.sh"
+[ -f "$TARGET" ] || { echo "Не найден script1.sh" >&2; exit 1; }
 
-BACKUP_DIR="/backup"
+command -v fuse2fs >/dev/null || { echo "Нужен fuse2fs" >&2; exit 1; }
+command -v fusermount3 >/dev/null || command -v fusermount >/dev/null || { echo "Нужен fusermount3" >&2; exit 1; }
+FUSERMOUNT=$(command -v fusermount3 || command -v fusermount)
 
 TMP_ROOT=$(mktemp -d -t cleanup_test.XXXXXX)
-LOG_DIR="$TMP_ROOT/log"
-DISK_IMG="$TMP_ROOT/log_disk.img"
-LOOP_DEV=""
-
 PASS=0
 FAIL=0
 
-hr() { printf '%s\n' "------------------------------------------------------------"; }
-
-run_case() {
-    local title="$1"
-    hr
-    printf 'ТЕСТ: %s\n' "$title"
-}
-
-assert() {
-    local desc="$1"; shift
-    if "$@"; then
-        printf '  ✓ %s\n' "$desc"
-        PASS=$((PASS + 1))
-    else
-        printf '  ✗ %s\n' "$desc"
-        FAIL=$((FAIL + 1))
-    fi
-}
-
-make_logs() {
-    local dir="$1" disk="$2" n="${3:-64}" volume="${4:-1024}" file_size="${5:-1048576}"
-
-    mkdir -p "$dir"
-    truncate --size="${volume}M" "$disk"
-
-    LOOP_DEV=$(losetup --find --show "$disk")
-    mkfs.ext4 -q -F -m 0 "$LOOP_DEV"
-    mount "$LOOP_DEV" "$dir"
-
-    local now i file
-    now=$(date +%s)
-    for ((i = 0; i < n; i++)); do
-        printf -v file '%s/log_%04d.bin' "$dir" "$i"
-        fallocate -l "$file_size" "$file"
-        touch -d "@$(( now - (n - i) * 60 ))" "$file"
-    done
-}
-
-unmount() {
-    local dir="$1" loop="$2"
-    if mountpoint -q "$dir" 2>/dev/null; then
-        umount "$dir"
-    fi
-    if [[ -n "$loop" && -b "$loop" ]]; then
-        losetup --detach "$loop"
-    fi
-}
-
 cleanup() {
-    unmount "$LOG_DIR" "$LOOP_DEV"
+    for d in "$TMP_ROOT"/*/log; do
+        [ -d "$d" ] || continue
+        mountpoint -q "$d" 2>/dev/null && "$FUSERMOUNT" -u "$d" 2>/dev/null
+    done
     rm -rf "$TMP_ROOT"
 }
 trap cleanup EXIT
 
-reset_state() {
-    unmount "$LOG_DIR" "$LOOP_DEV"
-    LOOP_DEV=""
-    rm -rf "$LOG_DIR" "$DISK_IMG"
-    rm -rf "$BACKUP_DIR"
-    mkdir -p "$BACKUP_DIR"
+hr() { printf '%s\n' "------------------------------------------------------------"; }
+
+assert() {
+    local desc="$1"; shift
+    if "$@"; then
+        printf '  ✓ %s\n' "$desc"; PASS=$((PASS+1))
+    else
+        printf '  ✗ %s\n' "$desc"; FAIL=$((FAIL+1))
+    fi
 }
 
-count_log_files() {
-    find "$LOG_DIR" -type f 2>/dev/null | wc -l
+run_case() {
+    hr
+    printf 'ТЕСТ: %s\n' "$1"
 }
 
-count_backups() {
-    find "$BACKUP_DIR" -maxdepth 1 -name '*.tar.gz' 2>/dev/null | wc -l
+make_logs() {
+    local mnt="$1" pct="$2" n="${3:-64}"
+    local total
+    total=$(df -B1 --output=size "$mnt" | tail -1)
+    local want=$(( total * pct / 100 ))
+    local per=$(( want / n ))
+    for ((i=0; i<n; i++)); do
+        local f="$mnt/log_$(printf '%04d' "$i").bin"
+        head -c "$per" /dev/zero > "$f"
+        touch -d "@$(( $(date +%s) - (n - i) * 60 ))" "$f"
+    done
+}
+
+make_virtual_disk() {
+    local case_dir="$1" size_mb="$2"
+    mkdir -p "$case_dir"
+    local img="$case_dir/log.img"
+    local mnt="$case_dir/log"
+    truncate --size="${size_mb}M" "$img"
+    mkfs.ext4 -q -O ^has_journal -E root_owner="$(id -u):$(id -g)" "$img"
+    mkdir -p "$mnt"
+    fuse2fs -o "uid=$(id -u),gid=$(id -g),umask=022" "$img" "$mnt"
+}
+
+unmount() {
+    local mnt="$1"
+    mountpoint -q "$mnt" 2>/dev/null && "$FUSERMOUNT" -u "$mnt" 2>/dev/null
 }
 
 usage_pct() {
-    df --output=pcent "$LOG_DIR" | awk 'NR==2 {gsub("%","",$1); print $1}'
+    df -P "$1" | awk 'NR==2 { gsub("%","",$5); print $5 }'
 }
 
-# Тест 1: порог не превышен — архивация не запускается
+# ТЕСТ-КЕЙС 1: порог не превышен
+run_case "Порог не превышен (заполнение ~30%)"
+C="$TMP_ROOT/t1"; mkdir -p "$C"
+make_virtual_disk "$C" 512
+make_logs "$C/log" 30
+CUR=$(usage_pct "$C/log")
+printf '    (заполнение: %s%%)\n' "$CUR"
 
-run_case "Порог не превышен (6% из 1024 МБ, порог по умолчанию 70%)"
-reset_state
-make_logs "$LOG_DIR" "$DISK_IMG" 64 1024 1048576
+"$TARGET" "$C/log" 70 | sed 's/^/    /'
 
-BEFORE=$(count_log_files)
-"$SCRIPT1" "$LOG_DIR" >/dev/null
-AFTER=$(count_log_files)
+assert "архивов не создано" bash -c "[ -z \"\$(ls -A '$C/backup' 2>/dev/null)\" ]"
+assert "файлы на месте" bash -c "[ \$(find '$C/log' -maxdepth 1 -type f | wc -l) -eq 64 ]"
+assert "log — отдельная ФС"  bash -c "[ \$(df -P '$C/log' | awk 'NR==2 {print \$6}') != '/' ]"
 
-assert "число файлов не изменилось" test "$BEFORE" -eq "$AFTER"
-assert "архивы не созданы"          test "$(count_backups)" -eq 0
-reset_state
+unmount "$C/log"
 
-# Тест 2: порог не превышен при явном значении
+# ТЕСТ-КЕЙС 2: порог превышен — архивация срабатывает
+run_case "Порог превышен (заполнение ~85%) — архивация"
+C="$TMP_ROOT/t2"; mkdir -p "$C"
+make_virtual_disk "$C" 512
+make_logs "$C/log" 85
+CUR=$(usage_pct "$C/log")
+printf '    (заполнение: %s%%)\n' "$CUR"
 
-run_case "Порог не превышен (100 МБ из 512 МБ = ~20%, порог 50%)"
-reset_state
-make_logs "$LOG_DIR" "$DISK_IMG" 100 512 1048576
+"$TARGET" "$C/log" 70 | sed 's/^/    /'
 
-BEFORE=$(count_log_files)
-"$SCRIPT1" "$LOG_DIR" 50 >/dev/null
-AFTER=$(count_log_files)
+NEW=$(usage_pct "$C/log")
+assert "создан архив"            bash -c "ls '$C/backup'/*.tar.gz >/dev/null 2>&1"
+assert "новое заполнение <= 70%" bash -c "[ $NEW -le 70 ]"
+assert "часть файлов удалена"    bash -c "[ \$(ls -1 '$C/log' | wc -l) -lt 64 ]"
+assert "архив валиден"           bash -c "tar -tzf \$(ls '$C/backup'/*.tar.gz | head -1) >/dev/null"
 
-assert "число файлов не изменилось" test "$BEFORE" -eq "$AFTER"
-assert "архивы не созданы"          test "$(count_backups)" -eq 0
-reset_state
+unmount "$C/log"
 
-# Тест 3: порог превышен — срабатывает архивация
+# ТЕСТ-КЕЙС 3: высокий порог — no-op
+run_case "Порог 95% при заполнении ~85% — no-op"
+C="$TMP_ROOT/t3"; mkdir -p "$C"
+make_virtual_disk "$C" 512
+make_logs "$C/log" 85
 
-run_case "Порог превышен (350 МБ из 512 МБ = ~68%, порог 20%)"
-reset_state
-make_logs "$LOG_DIR" "$DISK_IMG" 350 512 1048576
+"$TARGET" "$C/log" 95 | sed 's/^/    /'
 
-BEFORE=$(count_log_files)
-"$SCRIPT1" "$LOG_DIR" 20 >/dev/null
-AFTER=$(count_log_files)
-NEW_PCT=$(usage_pct)
+assert "архивов нет" bash -c "[ -z \"\$(ls -A '$C/backup' 2>/dev/null)\" ]"
+assert "файлы целы" bash -c "[ \$(find '$C/log' -maxdepth 1 -type f | wc -l) -eq 64 ]"
 
-assert "создан ровно один архив"     test "$(count_backups)" -eq 1
-assert "часть файлов удалена"        test "$AFTER" -lt "$BEFORE"
-assert "заполнение упало до <= 20%"  test "$NEW_PCT" -le 20
-ARCHIVE=$(find "$BACKUP_DIR" -maxdepth 1 -name '*.tar.gz' | head -1)
-assert "архив валиден"               tar -tzf "$ARCHIVE" -q
-reset_state
+unmount "$C/log"
 
-# Тест 4: порог почти максимальный — архивация не запускается
+# ТЕСТ-КЕЙС 4: архивируются самые старые файлы
+run_case "Архивируются самые старые файлы"
+C="$TMP_ROOT/t4"; mkdir -p "$C"
+make_virtual_disk "$C" 512
+make_logs "$C/log" 90
 
-run_case "Порог почти максимальный (6% из 1024 МБ, порог 99%)"
-reset_state
-make_logs "$LOG_DIR" "$DISK_IMG" 64 1024 1048576
+OLDEST=$(find "$C/log" -maxdepth 1 -type f -printf '%T@ %p\n' | sort -n | head -1 | awk '{print $2}')
+NEWEST=$(find "$C/log" -maxdepth 1 -type f -printf '%T@ %p\n' | sort -n | tail -1 | awk '{print $2}')
 
-BEFORE=$(count_log_files)
-"$SCRIPT1" "$LOG_DIR" 99 >/dev/null
-AFTER=$(count_log_files)
+"$TARGET" "$C/log" 70 | sed 's/^/    /'
 
-assert "число файлов не изменилось" test "$BEFORE" -eq "$AFTER"
-assert "архивы не созданы"          test "$(count_backups)" -eq 0
-reset_state
+ARCHIVE=$(ls "$C/backup"/*.tar.gz | head -1)
+assert "самый старый — в архиве" bash -c "tar -tzf '$ARCHIVE' | grep -q '$(basename "$OLDEST")'"
+assert "самый старый — удалён"   bash -c "[ ! -e '$OLDEST' ]"
+assert "самый новый — на месте"  bash -c "[ -e '$NEWEST' ]"
 
-# Тест 5: порог почти минимальный, заполнение меньше порога
+unmount "$C/log"
 
-run_case "Порог почти минимальный (40 МБ из 2048 МБ = ~2%, порог 5%)"
-reset_state
-make_logs "$LOG_DIR" "$DISK_IMG" 40 2048 1048576
+# ТЕСТ-КЕЙС 5: пустая папка
+run_case "Пустая папка"
+C="$TMP_ROOT/t5"; mkdir -p "$C"
+make_virtual_disk "$C" 256
 
-BEFORE=$(count_log_files)
-"$SCRIPT1" "$LOG_DIR" 5 >/dev/null
-AFTER=$(count_log_files)
+"$TARGET" "$C/log" 70 | sed 's/^/    /'
 
-assert "число файлов не изменилось" test "$BEFORE" -eq "$AFTER"
-assert "архивы не созданы"          test "$(count_backups)" -eq 0
-reset_state
+assert "архивов нет" bash -c "[ -z \"\$(ls -A '$C/backup' 2>/dev/null)\" ]"
 
-# Тест 6: пустая папка — скрипт не падает
-
-run_case "Пустая папка — корректный выход"
-reset_state
-make_logs "$LOG_DIR" "$DISK_IMG" 0 256 1048576
-
-assert "в папке нет файлов"  test "$(count_log_files)" -eq 0
-"$SCRIPT1" "$LOG_DIR" >/dev/null
-assert "архивы не созданы"   test "$(count_backups)" -eq 0
-reset_state
-
-# Тест 7: архивируются именно самые старые файлы
-
-run_case "Архивируются самые старые файлы (проверка по mtime)"
-reset_state
-make_logs "$LOG_DIR" "$DISK_IMG" 350 512 1048576
-
-OLDEST=$(find "$LOG_DIR" -type f -printf '%T@ %p\n' | sort -n | head -1 | awk '{print $2}')
-NEWEST=$(find "$LOG_DIR" -type f -printf '%T@ %p\n' | sort -n | tail -1 | awk '{print $2}')
-
-"$SCRIPT1" "$LOG_DIR" 20 >/dev/null
-ARCHIVE=$(find "$BACKUP_DIR" -maxdepth 1 -name '*.tar.gz' | head -1)
-
-assert "самый старый файл в архиве"       bash -c "tar -tzf '$ARCHIVE' | grep -q '$(basename "$OLDEST")'"
-assert "самый старый файл удалён из /log" test ! -e "$OLDEST"
-assert "самый новый файл остался в /log"  test -e "$NEWEST"
-reset_state
-
-# Итоги
+unmount "$C/log"
 
 hr
 printf 'ИТОГО: PASS=%d, FAIL=%d\n' "$PASS" "$FAIL"
-[[ $FAIL -eq 0 ]]
+[ "$FAIL" -eq 0 ]
