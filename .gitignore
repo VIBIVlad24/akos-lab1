@@ -1,2 +1,4 @@
 test/log.img
 test/log-mount/
+test/backup/
+test/fuse2fs-test.sh
